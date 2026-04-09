@@ -69,6 +69,7 @@ Stack
 ────────────────────────────────────────────────────────────────────────────────
 """
 
+import enum
 import hmac
 import http.server
 import json
@@ -85,6 +86,78 @@ import webbrowser
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
+
+# ─── Errors ──────────────────────────────────────────────────────────────────
+# Classified errors so that user-facing failures (validation, not-found, auth)
+# can be distinguished from real bugs (internal, external). Pattern borrowed
+# from dyad-sh/dyad's DyadError. See rules/error-classification.md.
+
+
+class ApiManagerErrorKind(enum.Enum):
+    Validation = "validation"         # invalid input — malformed, missing, bad format
+    NotFound = "not_found"            # file, key, or entry doesn't exist
+    Auth = "auth"                     # unlock password missing or wrong
+    Precondition = "precondition"     # wrong state — unlock required, not writable
+    Conflict = "conflict"             # duplicate, concurrent modification
+    UserCancelled = "user_cancelled"  # user declined
+    RateLimited = "rate_limited"      # service rate limit during validation
+    External = "external"             # upstream service failure (always reported)
+    Internal = "internal"             # bug, invariant violation (always reported)
+    Unknown = "unknown"               # unclassified (always reported)
+
+
+# Error kinds that should NOT be sent to error-reporting dashboards.
+# These are high-volume user-shaped failures that would drown out real bugs.
+_TELEMETRY_FILTERED_KINDS = frozenset({
+    ApiManagerErrorKind.Validation,
+    ApiManagerErrorKind.NotFound,
+    ApiManagerErrorKind.Auth,
+    ApiManagerErrorKind.Precondition,
+    ApiManagerErrorKind.Conflict,
+    ApiManagerErrorKind.UserCancelled,
+    ApiManagerErrorKind.RateLimited,
+})
+
+# Mapping from error kind to HTTP status code. Used at the HTTP boundary
+# so every throw site lands on the right status automatically.
+_KIND_TO_HTTP_STATUS = {
+    ApiManagerErrorKind.Validation: 400,
+    ApiManagerErrorKind.NotFound: 404,
+    ApiManagerErrorKind.Auth: 401,
+    ApiManagerErrorKind.Precondition: 412,
+    ApiManagerErrorKind.Conflict: 409,
+    ApiManagerErrorKind.UserCancelled: 400,
+    ApiManagerErrorKind.RateLimited: 429,
+    ApiManagerErrorKind.External: 502,
+    ApiManagerErrorKind.Internal: 500,
+    ApiManagerErrorKind.Unknown: 500,
+}
+
+
+class ApiManagerError(Exception):
+    """Classified application error. Use instead of raw Exception.
+
+    Example:
+        raise ApiManagerError("path must be a .env file", ApiManagerErrorKind.Validation)
+    """
+
+    def __init__(self, message, kind=ApiManagerErrorKind.Unknown):
+        super().__init__(message)
+        self.kind = kind
+
+    @property
+    def http_status(self):
+        return _KIND_TO_HTTP_STATUS.get(self.kind, 500)
+
+    @property
+    def should_report(self):
+        """Whether this error should be sent to error-reporting dashboards."""
+        return self.kind not in _TELEMETRY_FILTERED_KINDS
+
+
+def is_api_manager_error(error):
+    return isinstance(error, ApiManagerError)
+
 
 # ─── Config ──────────────────────────────────────────────────────────────────
 
@@ -1938,6 +2011,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _send_error(self, error):
+        """Send an ApiManagerError as a JSON response with the correct HTTP status."""
+        self._send_json(error.http_status, {
+            "error": str(error),
+            "kind": error.kind.value,
+        })
+        # Future: if `error.should_report`, forward to error reporting here.
+
     def _read_json(self):
         length = int(self.headers.get("Content-Length", "0"))
         if not length:
@@ -1946,17 +2027,47 @@ class Handler(http.server.BaseHTTPRequestHandler):
         try:
             return json.loads(raw)
         except Exception:
-            return {}
+            raise ApiManagerError("request body is not valid JSON", ApiManagerErrorKind.Validation)
 
     def _safe_path(self, raw_path):
+        """Validate and canonicalize a path. Raises ApiManagerError on bad input."""
         if not raw_path:
-            return None, "path required"
+            raise ApiManagerError("path required", ApiManagerErrorKind.Validation)
         path = os.path.abspath(os.path.expanduser(raw_path))
         if not (path.endswith(".env") or ".env." in os.path.basename(path)):
-            return None, "path must be a .env file"
-        return path, None
+            raise ApiManagerError("path must be a .env file", ApiManagerErrorKind.Validation)
+        return path
+
+    def _require_unlocked(self, reason="unlock required"):
+        """Precondition check: raise if the request isn't unlocked."""
+        if not is_unlocked(self.headers):
+            raise ApiManagerError(reason, ApiManagerErrorKind.Auth)
+
+    def _dispatch(self, method_fn):
+        """Run a request handler with classified error handling."""
+        try:
+            method_fn()
+        except ApiManagerError as e:
+            self._send_error(e)
+        except Exception as e:
+            # Unclassified → Internal, always reportable
+            sys.stderr.write(f"[api-manager] internal error: {type(e).__name__}: {e}\n")
+            wrapped = ApiManagerError(
+                f"internal error: {type(e).__name__}",
+                ApiManagerErrorKind.Internal,
+            )
+            self._send_error(wrapped)
 
     def do_GET(self):
+        self._dispatch(self._handle_get)
+
+    def do_POST(self):
+        self._dispatch(self._handle_post)
+
+    def do_DELETE(self):
+        self._dispatch(self._handle_delete)
+
+    def _handle_get(self):
         url = urlparse(self.path)
 
         if url.path == "/" or url.path == "/index.html":
@@ -1985,9 +2096,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if url.path == "/api/env":
             qs = parse_qs(url.query)
             raw = qs.get("path", [""])[0]
-            path, err = self._safe_path(raw)
-            if err:
-                return self._send_json(400, {"error": err})
+            path = self._safe_path(raw)
             entries = parse_env(path)
             unlocked = is_unlocked(self.headers)
             audit_log("read", file_path=path)
@@ -2008,22 +2117,20 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if url.path == "/api/audit":
             return self._send_json(200, {"events": audit_recent(50)})
 
-        self._send_json(404, {"error": "not found"})
+        raise ApiManagerError("not found", ApiManagerErrorKind.NotFound)
 
-    def do_POST(self):
+    def _handle_post(self):
         url = urlparse(self.path)
 
         if url.path == "/api/env":
             body = self._read_json()
-            path, err = self._safe_path(body.get("path", ""))
-            if err:
-                return self._send_json(400, {"error": err})
+            path = self._safe_path(body.get("path", ""))
             key = (body.get("key") or "").strip()
             value = body.get("value", "")
             if not key or not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", key):
-                return self._send_json(400, {"error": "invalid key name"})
+                raise ApiManagerError("invalid key name", ApiManagerErrorKind.Validation)
             if value == "":
-                return self._send_json(400, {"error": "value required"})
+                raise ApiManagerError("value required", ApiManagerErrorKind.Validation)
             backup_file(path)
             entries = parse_env(path)
             entries = upsert(entries, key, value)
@@ -2034,19 +2141,22 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self._send_json(200, {"ok": True})
 
         if url.path == "/api/validate":
-            if not is_unlocked(self.headers):
-                return self._send_json(401, {"error": "unlock required to validate"})
+            self._require_unlocked("unlock required to validate")
             body = self._read_json()
-            path, err = self._safe_path(body.get("path", ""))
-            if err:
-                return self._send_json(400, {"error": err})
+            path = self._safe_path(body.get("path", ""))
             key = (body.get("key") or "").strip()
+            if not key:
+                raise ApiManagerError("key required", ApiManagerErrorKind.Validation)
             entries = parse_env(path)
             entry = next((e for e in entries if e["kind"] == "kv" and e["key"] == key), None)
             if not entry:
-                return self._send_json(404, {"error": "key not found"})
+                raise ApiManagerError(f"key not found: {key}", ApiManagerErrorKind.NotFound)
             svc = detect_service(entry["value"], key)
-            status = validate_key(entry["value"], svc)
+            try:
+                status = validate_key(entry["value"], svc)
+            except RuntimeError as e:
+                # Network failure during validation = External
+                raise ApiManagerError(str(e), ApiManagerErrorKind.External)
             metadata_set(path, key,
                          validation_status=status,
                          last_validated=now_iso(),
@@ -2055,28 +2165,31 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self._send_json(200, {"status": status})
 
         if url.path == "/api/find-key":
-            if not is_unlocked(self.headers):
-                return self._send_json(401, {"error": "unlock required"})
+            self._require_unlocked("unlock required")
             body = self._read_json()
             key = (body.get("key") or "").strip()
             if not key:
-                return self._send_json(400, {"error": "key required"})
+                raise ApiManagerError("key required", ApiManagerErrorKind.Validation)
             return self._send_json(200, {"hits": find_key_everywhere(key)})
 
         if url.path == "/api/rotate":
-            if not is_unlocked(self.headers):
-                return self._send_json(401, {"error": "unlock required to rotate"})
+            self._require_unlocked("unlock required to rotate")
             body = self._read_json()
             key = (body.get("key") or "").strip()
             value = body.get("value", "")
             files = body.get("files", [])
             do_validate = bool(body.get("validate", True))
             if not key or not value or not files:
-                return self._send_json(400, {"error": "key, value, and files required"})
+                raise ApiManagerError("key, value, and files required", ApiManagerErrorKind.Validation)
             updated = 0
+            last_ok_path = None
             for raw_path in files:
-                path, err = self._safe_path(raw_path)
-                if err:
+                # Rotation is tolerant of per-file failures: skip bad paths,
+                # continue with the rest. We don't want one bad entry to
+                # abort a multi-file rotation mid-way.
+                try:
+                    path = self._safe_path(raw_path)
+                except ApiManagerError:
                     continue
                 if not os.path.exists(path):
                     continue
@@ -2089,33 +2202,33 @@ class Handler(http.server.BaseHTTPRequestHandler):
                              service=svc["name"] if svc else None,
                              rotated_at=now_iso())
                 updated += 1
+                last_ok_path = path
             audit_log("rotate", key_name=key, details={"files": files, "updated": updated})
             validation = None
             if do_validate:
                 svc = detect_service(value, key)
-                validation = validate_key(value, svc)
-                if updated > 0 and files:
-                    last_path, _ = self._safe_path(files[0])
-                    if last_path:
-                        metadata_set(last_path, key,
-                                     validation_status=validation,
-                                     last_validated=now_iso())
+                try:
+                    validation = validate_key(value, svc)
+                except RuntimeError as e:
+                    validation = f"error: {e}"
+                if last_ok_path:
+                    metadata_set(last_ok_path, key,
+                                 validation_status=validation,
+                                 last_validated=now_iso())
                 audit_log("validate", key_name=key, details={"status": validation, "context": "post-rotation"})
             return self._send_json(200, {"updated": updated, "validation": validation})
 
-        self._send_json(404, {"error": "not found"})
+        raise ApiManagerError("not found", ApiManagerErrorKind.NotFound)
 
-    def do_DELETE(self):
+    def _handle_delete(self):
         url = urlparse(self.path)
         if url.path != "/api/env":
-            return self._send_json(404, {"error": "not found"})
+            raise ApiManagerError("not found", ApiManagerErrorKind.NotFound)
         body = self._read_json()
-        path, err = self._safe_path(body.get("path", ""))
-        if err:
-            return self._send_json(400, {"error": err})
+        path = self._safe_path(body.get("path", ""))
         key = (body.get("key") or "").strip()
         if not key:
-            return self._send_json(400, {"error": "key required"})
+            raise ApiManagerError("key required", ApiManagerErrorKind.Validation)
         backup_file(path)
         entries = parse_env(path)
         entries = delete_key(entries, key)
