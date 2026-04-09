@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.venv/
+venv/
+env/
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# api-manager runtime state — must never be committed
+# (the actual state lives in ~/.api-manager/ anyway, but be safe)
+.api-manager/
+metadata.json
+audit.db
+backups/
+
+# Env files — the tool manages these, they should NEVER live in this repo
+.env
+.env.*
+!.env.example
+
+# Don't commit screenshots or recordings from local testing
+screenshots/*.local.*
+*.mov.local
